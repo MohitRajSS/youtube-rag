@@ -20,11 +20,9 @@ def fetch_transcript(video_id: str) -> str:
         ytt_api = YouTubeTranscriptApi()
         transcript_list = ytt_api.fetch(video_id, languages=["en"])
         transcript = " ".join(chunk.text for chunk in transcript_list)
-        print("✅ Transcript fetched successfully.\n")
         return transcript
 
     except TranscriptsDisabled:
-        print("❌ No captions available for this video.")
         return None
 
 
@@ -37,8 +35,6 @@ def build_vector_store(transcript: str):
     )
 
     chunks = splitter.create_documents([transcript])
-
-    print(f"✅ Created {len(chunks)} chunks.\n")
 
     embeddings = HuggingFaceEmbeddings(
         model_name="sentence-transformers/all-MiniLM-L6-v2"
@@ -60,55 +56,69 @@ def format_history(chat_history):
     history = ""
 
     for message in chat_history:
-        history += f"{message['role'].capitalize()}: {message['content']}\n"
+        history += (
+            f"{message['role'].capitalize()}: {message['content']}\n"
+        )
 
     return history
 
 
-def main():
+def initialize_rag(youtube_url: str):
+    """
+    Initializes the RAG pipeline.
 
-    # ----------------------------
-    # YouTube URL
-    # ----------------------------
-    youtube_url = input("Enter YouTube URL: ").strip()
+    Returns:
+        retriever
+        llm
+        parser
+        prompt
+        status_messages
+    """
+
+    status_messages = []
 
     video_id = get_video_id(youtube_url)
 
     if video_id is None:
-        raise SystemExit("❌ Invalid YouTube URL.")
+        raise ValueError("Invalid YouTube URL.")
 
-    print(f"🎬 Video ID: {video_id}\n")
+    status_messages.append(f"🎬 Video ID: {video_id}")
 
-    # ----------------------------
-    # Fetch Transcript
-    # ----------------------------
     transcript = fetch_transcript(video_id)
 
     if transcript is None:
-        raise SystemExit("Transcript unavailable.")
+        raise ValueError("Transcript unavailable.")
 
-    # ----------------------------
-    # Build Vector Store
-    # ----------------------------
-    vector_store = build_vector_store(transcript)
+    status_messages.append("✅ Transcript fetched successfully.")
+
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=1000,
+        chunk_overlap=200,
+    )
+
+    chunks = splitter.create_documents([transcript])
+
+    status_messages.append(f"✅ Created {len(chunks)} chunks.")
+
+    embeddings = HuggingFaceEmbeddings(
+        model_name="sentence-transformers/all-MiniLM-L6-v2"
+    )
+
+    vector_store = FAISS.from_documents(chunks, embeddings)
+
+    status_messages.append("✅ Vector Store Created.")
 
     retriever = vector_store.as_retriever(
         search_type="similarity",
         search_kwargs={"k": 4},
     )
 
-    # ----------------------------
-    # LLM
-    # ----------------------------
     llm = ChatOllama(
         model="qwen3:8b",
         temperature=0.2,
         num_ctx=2048,
     )
 
-    # ----------------------------
-    # Prompt
-    # ----------------------------
     prompt = PromptTemplate(
         template="""
 You are a helpful AI assistant.
@@ -137,9 +147,56 @@ Answer:
 
     parser = StrOutputParser()
 
-    # ----------------------------
-    # Store conversation
-    # ----------------------------
+    return retriever, llm, prompt, parser, status_messages
+
+
+def ask_question(
+    question,
+    retriever,
+    llm,
+    prompt,
+    parser,
+    chat_history,
+):
+    """
+    Ask a question to the RAG pipeline.
+    """
+
+    history = format_history(chat_history)
+
+    parallel_chain = RunnableParallel(
+        {
+            "context": retriever | RunnableLambda(format_docs),
+            "question": RunnablePassthrough(),
+            "history": RunnableLambda(lambda _: history),
+        }
+    )
+
+    chain = parallel_chain | prompt | llm | parser
+
+    answer = chain.invoke(question)
+
+    return answer
+
+
+def main():
+    """
+    CLI version.
+    """
+
+    youtube_url = input("Enter YouTube URL: ").strip()
+
+    (
+        retriever,
+        llm,
+        prompt,
+        parser,
+        status_messages,
+    ) = initialize_rag(youtube_url)
+
+    for msg in status_messages:
+        print(msg)
+
     chat_history = []
 
     print("=" * 80)
@@ -147,34 +204,24 @@ Answer:
     print("Type 'exit' to quit.")
     print("=" * 80)
 
-    # ----------------------------
-    # Chat Loop
-    # ----------------------------
     while True:
 
         question = input("\nYou: ").strip()
 
         if question.lower() == "exit":
-            print("\n👋 Goodbye!")
             break
 
-        history = format_history(chat_history)
-
-        parallel_chain = RunnableParallel(
-            {
-                "context": retriever | RunnableLambda(format_docs),
-                "question": RunnablePassthrough(),
-                "history": RunnableLambda(lambda _: history),
-            }
+        answer = ask_question(
+            question,
+            retriever,
+            llm,
+            prompt,
+            parser,
+            chat_history,
         )
-
-        main_chain = parallel_chain | prompt | llm | parser
-
-        answer = main_chain.invoke(question)
 
         print("\nAssistant:", answer)
 
-        # Save user message
         chat_history.append(
             {
                 "role": "user",
@@ -182,7 +229,6 @@ Answer:
             }
         )
 
-        # Save assistant response
         chat_history.append(
             {
                 "role": "assistant",
